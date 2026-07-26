@@ -1,0 +1,11 @@
+# .cmd は Shift-JIS (CP932) + CRLF でないと cmd.exe の解析位置がずれ、行が
+# 途中で切れて誤動作する。clone 先の core.autocrlf 設定に関わらず CRLF で
+# 取り出させる。Shift-JIS は 2 バイト目に 0x0A / 0x0D を含まないので、
+# 改行変換をかけても文字が壊れることはない。
+*.cmd  text eol=crlf
+
+# 残りは LF で統一
+*.py   text eol=lf
+*.md   text eol=lf
+*.ini  text eol=lf
+*.txt  text eol=lf

@@ -1,0 +1,23 @@
+# いったん全部無視して、配布に必要なものだけを戻す方式。
+# こうしておくと transcripts\ の中身を取り違えて公開する事故が起きない。
+# 新しくファイルを足したときは、ここに ! 付きで追記すること。
+
+*
+
+!.gitignore
+!.gitattributes
+!LICENSE
+!README.md
+!requirements.txt
+!settings.ini
+!transcribe.py
+!proc_loopback.py
+!セットアップ.cmd
+!文字起こし開始.cmd
+!文字起こし開始-マイクも含む.cmd
+
+# 除外されるもの（参考）
+#   venv\        … 作成した PC でしか動かない。各自 セットアップ.cmd で作る
+#   models\      … 2.9GB。初回起動時に自動ダウンロードされる
+#   transcripts\ … 収録した中身そのもの
+#   __pycache__\ … 自動生成

@@ -1,0 +1,27 @@
+# WhisperTranscribe が使うライブラリ
+#
+# 「セットアップ.cmd」から自動で読み込まれるので、普段は触らなくてよい。
+# 動作実績のあるバージョンで固定してある。CUDA 系はバージョンの相性が出やすいため、
+# 動いている環境をむやみに上げないこと。
+#
+# 手動で入れ直す場合:
+#   venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# 認識エンジン。PyTorch ではなく CTranslate2 で動くので環境が軽い
+faster-whisper==1.2.1
+
+# WASAPI ループバック（PC で鳴っている音の取得）。これのため Windows 専用
+PyAudioWPatch==0.2.12.8
+
+# 48kHz -> 16kHz のリサンプリング
+scipy==1.18.0
+
+# transcribe.py と proc_loopback.py が直接 import する。ctranslate2 の依存でも
+# 入るが、直接使う以上ここにも明示しておく
+numpy==2.5.1
+
+# Windows の証明書ストアを使う（Avast 等の HTTPS スキャン環境での SSL エラー対策）
+truststore==0.10.4
+
+# GPU 推論用。cublas と nvrtc はこれの依存として一緒に入る
+nvidia-cudnn-cu12==9.24.0.43
