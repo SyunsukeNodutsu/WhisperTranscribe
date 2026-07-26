@@ -8,6 +8,7 @@
 !.gitattributes
 !LICENSE
 !README.md
+!demo.gif
 !requirements.txt
 !settings.ini
 !transcribe.py
