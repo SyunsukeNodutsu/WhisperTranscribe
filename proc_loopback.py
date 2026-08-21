@@ -30,6 +30,28 @@ kernel32 = ctypes.WinDLL("kernel32")
 mmdevapi = ctypes.WinDLL("Mmdevapi")
 
 
+THREAD_PRIORITY_HIGHEST = 2
+
+
+def raise_thread_priority():
+    """呼び出したスレッドの優先度を上げる。
+
+    音声の取り込みは 100ms あたり 0.1ms ほどしか CPU を使わないが、
+    数秒スケジュールされないだけでバッファが溢れて音が消える。3D ゲームなど
+    負荷の高いアプリと同時に動かすとこれが起きる。
+    使用時間が短いので、優先度を上げても他のアプリはほとんど影響を受けない。
+    """
+    try:
+        # argtypes を省くと、64bit の擬似ハンドル (0xfffffffffffffffe) が
+        # 32bit に切り詰められて黙って失敗する
+        kernel32.GetCurrentThread.restype = wintypes.HANDLE
+        kernel32.SetThreadPriority.argtypes = [wintypes.HANDLE, ctypes.c_int]
+        kernel32.SetThreadPriority.restype = wintypes.BOOL
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), THREAD_PRIORITY_HIGHEST)
+    except Exception:
+        pass                                          # 上げられなくても動作はする
+
+
 class ProcessLoopbackError(RuntimeError):
     """このモジュール由来の失敗。呼び出し側はこれだけ捕まえればよい"""
 
@@ -310,12 +332,15 @@ class ProcessLoopbackStream:
     呼び出し側の処理が止まらないようにする（無音判定は呼び出し側に任せる）。
     """
 
-    def __init__(self, pid, rate=48000, channels=2, buffer_seconds=4.0):
+    def __init__(self, pid, rate=48000, channels=2, buffer_seconds=10.0):
         self.pid = pid
         self.rate = rate
         self.channels = channels
         self.frame_bytes = channels * 4          # 呼び出し側には常に float32 で渡す
+        # 読み出し側が一時的に止まっても耐えられる長さ。ゲームなどで CPU を持って
+        # いかれると数秒単位で止まることがあり、短いと黙って音が消える
         self._max_bytes = int(rate * buffer_seconds) * self.frame_bytes
+        self._dropped_bytes = 0
 
         self._buf = bytearray()
         self._cond = threading.Condition()
@@ -348,6 +373,12 @@ class ProcessLoopbackStream:
             data = bytes(self._buf)
             self._buf.clear()
         return data + b"\x00" * (need - len(data))
+
+    @property
+    def dropped_seconds(self):
+        """バッファ溢れで捨てた音声の累計秒数"""
+        with self._cond:
+            return self._dropped_bytes / (self.rate * self.frame_bytes)
 
     def close(self):
         self._stop.set()
@@ -412,6 +443,7 @@ class ProcessLoopbackStream:
     def _run(self):
         client = capture = None
         event = None
+        raise_thread_priority()                       # 取りこぼし対策
         try:
             ole32.CoInitializeEx(None, 0)             # MTA
             client = self._activate()
@@ -465,7 +497,12 @@ class ProcessLoopbackStream:
                     with self._cond:
                         self._buf.extend(chunk)
                         if len(self._buf) > self._max_bytes:   # 認識が詰まったら古い方を捨てる
-                            del self._buf[:len(self._buf) - self._max_bytes]
+                            over = len(self._buf) - self._max_bytes
+                            del self._buf[:over]
+                            # 捨てた分は二度と戻らないので、必ず数えて呼び出し側へ知らせる。
+                            # 黙って消えると、後から書き起こしを読んだときに
+                            # 「講演者が黙っていた」のか「取りこぼした」のか区別できない
+                            self._dropped_bytes += over
                         self._cond.notify_all()
         finally:
             try:

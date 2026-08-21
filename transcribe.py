@@ -70,13 +70,28 @@ from faster_whisper import WhisperModel  # noqa: E402
 import proc_loopback                     # noqa: E402
 
 TARGET_SR = 16000     # Whisper の入力サンプリングレート
-BLOCK_MS = 100        # 音声を読む単位
+# 音量を判定する単位。粗いと息継ぎの前後に発話が食い込んで無音と認めてもらえない
+# （半分だけ発話が入ったブロックでも RMS は 0.7 倍にしかならず、閾値を超える）。
+# min_silence で指定した長さに加えて、最悪このブロック 2 個ぶんの無音が
+# 余分に必要になるため、早口の素材ほど細かくしておく
+BLOCK_MS = 25
+PREROLL_MS = 300      # 語頭を切らないための先読み
 MIN_SPEECH_MS = 400   # これ未満の発話は認識に回さない
+CUT_SEARCH_MS = 4000  # 時間切れの区切りで、静かな所を探す範囲
+MIN_CUT_KEEP_MS = 2000  # 時間切れの区切りで、最低限これだけは切り出す
+# 暗騒音への追従で、しきい値を threshold の何倍まで上げてよいか。
+# ここを大きくすると「発話とみなす音量の下限」という threshold の意味が崩れ、
+# 設定値を満たしている声でも勝手に切り捨てられる。処理するのは特定アプリの
+# 音声で環境ノイズが乗らないため、追従は控えめでよい
+NOISE_GATE_MAX_RATIO = 1.5
 IDLE_FLUSH_S = 1.5    # データが来なくなってこの秒数で区切る（再生停止時の対策）
 
 # 無音区間で Whisper が創作しがちな定型句（音が小さい区間のみ除去する）
+# 講演では「ご清聴」が出る。YouTube 由来の「ご視聴」だけでは素通りしてしまう
 JUNK_PHRASES = (
     "ご視聴ありがとうございました",
+    "ご清聴ありがとうございました",
+    "ご静聴ありがとうございました",
     "ご覧いただきありがとうございました",
     "チャンネル登録",
     "最後までご視聴",
@@ -114,6 +129,9 @@ class Source:
 
     「何から読むか」は open_stream に任せてあるので、再生デバイス全体でも
     特定プロセスの音でも同じ区切り処理を通せる。
+
+    このスレッドは読み出しが遅れるとその分だけ音が失われるため、重い処理は
+    置かない。16kHz へのリサンプルは認識側（transcribe_worker）で行う。
     """
 
     def __init__(self, tag, q, args, stats, rate, channels, open_stream, label):
@@ -125,8 +143,9 @@ class Source:
         g = gcd(self.rate, TARGET_SR)
         self.up, self.down = TARGET_SR // g, self.rate // g
 
+        self.stream = None             # 取りこぼしを問い合わせるため保持する
         self.lock = threading.Lock()
-        self.pre = deque(maxlen=3)     # 語頭を切らないための先読み (300ms)
+        self.pre = deque(maxlen=max(1, PREROLL_MS // BLOCK_MS))   # 語頭を切らないための先読み
         self.buf = []
         self.speech_ms = 0
         self.silence_ms = 0
@@ -135,19 +154,37 @@ class Source:
         self.last_data = time.time()
 
     # --- 呼び出し側は必ず lock を取ってから ---
+    def _split_at_quietest(self):
+        """時間切れの区切りで、語の途中を避けられる位置を探して切り分ける。
+
+        探索範囲が狭いと、喋りっぱなしの素材では句の切れ目が範囲に入らず、
+        結局は語の途中で切った音声を認識に渡すことになる。そうすると
+        Whisper が中途半端な末尾を「ご清聴ありがとうございました」のような
+        それらしい定型句で埋めてしまうため、数秒ぶん見て谷を探す。
+        """
+        keep = MIN_CUT_KEEP_MS // BLOCK_MS          # ここより手前では切らない
+        span = min(CUT_SEARCH_MS // BLOCK_MS, len(self.buf) - keep)
+        if span < 3:
+            return []
+        tail = self.buf[-span:]
+        levels = np.array([float(np.sqrt(np.mean(np.square(b)))) for b in tail])
+        # 単発の落ち込みではなく谷を選びたいので、ならしてから最小値を取る
+        smooth = np.convolve(levels, np.ones(3) / 3, mode="valid")
+        i = int(np.argmin(smooth)) + 1              # ならした窓の中心に戻す
+        if i >= len(tail) - 1:
+            return []
+        cut = len(self.buf) - span + i
+        carry, self.buf = self.buf[cut:], self.buf[:cut]
+        return carry
+
     def _emit(self, forced=False):
         carry = []
         if self.buf and self.speech_ms >= MIN_SPEECH_MS:
-            if forced and len(self.buf) > 12:
-                # 時間切れの区切りは、末尾 1 秒のうち最も静かな所を選んで
-                # 単語の途中で切れるのを避ける。残りは次のセグメントへ回す
-                tail = self.buf[-10:]
-                levels = [float(np.sqrt(np.mean(np.square(b)))) for b in tail]
-                i = int(np.argmin(levels))
-                if i < len(tail) - 1:
-                    cut = len(self.buf) - 10 + i
-                    carry, self.buf = self.buf[cut:], self.buf[:cut]
-            self.q.put((self.tag, self.seg_start, np.concatenate(self.buf)))
+            if forced:
+                carry = self._split_at_quietest()
+            # 入力のサンプリングレートのまま渡す。リサンプルは認識側の仕事
+            self.q.put((self.tag, self.seg_start, np.concatenate(self.buf),
+                        self.up, self.down))
             self.stats["queued"] += 1
 
         self.buf, self.speech_ms, self.silence_ms, self.seg_start = [], 0, 0, None
@@ -156,6 +193,10 @@ class Source:
             self.buf = carry
             self.speech_ms = len(carry) * BLOCK_MS
             self.seg_start = datetime.now()
+
+    def dropped_seconds(self):
+        """入力側で取りこぼした音声の累計秒数（対応していない入力では 0）"""
+        return float(getattr(self.stream, "dropped_seconds", 0.0) or 0.0)
 
     def flush_if_idle(self):
         """再生が止まってデータが来なくなった場合の取り出し"""
@@ -168,8 +209,11 @@ class Source:
             self._emit()
 
     def run(self, stop):
+        # 読み出しが数秒止まると入力側のバッファが溢れて音が消える。
+        # このループ自体は軽いので、優先度だけ上げておけば取りこぼしにくい
+        proc_loopback.raise_thread_priority()
         try:
-            stream = self.open_stream()
+            stream = self.stream = self.open_stream()
         except Exception as e:
             print(f"\n[{self.tag}] 音声の取得を開始できませんでした: {e}", file=sys.stderr)
             stop.set()
@@ -183,22 +227,27 @@ class Source:
                 except Exception:
                     continue
 
+                # ここから下はブロックごとに毎回走るので、モノラル化と音量だけに
+                # とどめる。リサンプルを挟んでいた頃は 100ms ごとにフィルタ設計から
+                # やり直しており、負荷が上がった時にここで詰まって音を取りこぼした
                 x = np.frombuffer(data, dtype=np.float32)
                 if self.channels > 1:
                     x = x.reshape(-1, self.channels).mean(axis=1)
-                if self.up != self.down:
-                    x = resample_poly(x, self.up, self.down).astype(np.float32)
                 if x.size == 0:
                     continue
 
                 rms = float(np.sqrt(np.mean(np.square(x))))
                 with self.lock:
                     self.last_data = time.time()
-                    is_speech = rms > max(self.args.threshold, self.noise * 3.0)
-                    if not is_speech:
-                        # 暗騒音は「発話でない区間」だけで更新する。発話中も混ぜて
-                        # 更新すると、講演のように喋りっぱなしの素材では推定値が
-                        # 発話音量まで上がり、数分後から声を無音と判定して落とす
+                    gate = min(max(self.args.threshold, self.noise * 3.0),
+                               self.args.threshold * NOISE_GATE_MAX_RATIO)
+                    is_speech = rms > gate
+                    # 暗騒音として学習するのは「設定値より下のブロック」だけにする。
+                    # 「無音と判定したブロック」で学習すると正のフィードバックになり、
+                    # 声の小さい話者を一度取りこぼした瞬間にその音量が暗騒音として
+                    # 学習され、しきい値がさらに上がって以降ずっと落とし続ける
+                    # （話者が交代した直後から数分間まったく拾えなくなる形で出る）
+                    if rms < self.args.threshold:
                         self.noise = 0.995 * self.noise + 0.005 * rms
 
                     if is_speech:
@@ -257,7 +306,11 @@ def transcribe_worker(model, q, writer, args, stats, lock):
         item = q.get()
         if item is None:
             break
-        tag, ts, audio = item
+        tag, ts, audio, up, down = item
+        if up != down:
+            # 区切りごとにまとめて 16kHz へ落とす。ブロック単位でかけていた頃と
+            # 違い、継ぎ目でフィルタの過渡が入らないぶん波形もきれいになる
+            audio = resample_poly(audio, up, down).astype(np.float32)
         try:
             segments, _ = model.transcribe(
                 audio,
@@ -531,12 +584,28 @@ def main():
         threading.Thread(target=s.run, args=(stop,), daemon=True).start()
 
     deadline = time.time() + args.duration if args.duration else float("inf")
+    reported_drop = 0.0
     try:
         while not stop.is_set() and time.time() < deadline:
             for s in sources:
                 s.flush_if_idle()     # 再生が止まったまま溜まっている分を送る
+
+            # 取りこぼしはその場で印を残す。後から読み返したときに、講演者が
+            # 黙っていたのか音が消えたのかを区別できるようにするため
+            dropped = sum(s.dropped_seconds() for s in sources)
+            if dropped - reported_drop >= 0.5:
+                mark = (f"[{datetime.now():%H:%M:%S}] ---- 音声を約 "
+                        f"{dropped - reported_drop:.1f} 秒ぶん取りこぼしました"
+                        f"（PC の負荷が高い可能性があります） ----")
+                with write_lock:
+                    writer.write(mark + "\n")
+                    writer.flush()
+                print(("\n" if not args.echo else "") + mark, flush=True)
+                reported_drop = dropped
+
             if not args.echo:
-                print(f"\r保存した行数: {stats['lines']}   処理待ち: {q.qsize()}    ",
+                loss = f"   欠落: {dropped:.1f}s" if dropped >= 0.5 else ""
+                print(f"\r保存した行数: {stats['lines']}   処理待ち: {q.qsize()}{loss}    ",
                       end="", flush=True)
             time.sleep(0.3)
     except KeyboardInterrupt:
@@ -551,6 +620,10 @@ def main():
     with write_lock:
         writer.close()
     print(f"終了。{stats['lines']} 行を保存しました -> {out_path}")
+    total_dropped = sum(s.dropped_seconds() for s in sources)
+    if total_dropped >= 0.5:
+        print(f"注意  : 音声を合計 約{total_dropped:.1f} 秒ぶん取りこぼしています。"
+              "重いアプリを同時に動かしていた場合はご確認ください")
     sys.stdout.flush()
     # 録音スレッドは WASAPI の read で止まっていることがあり、
     # p.terminate() や通常終了だとハングするため強制終了する

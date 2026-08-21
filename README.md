@@ -37,6 +37,11 @@ VRAM が足りない場合は `settings.ini` で `compute = int8_float16`（消�
 配布された `WhisperTranscribe` フォルダを好きな場所にコピーする。C ドライブでなくてよい。
 パスに日本語が混じらない場所を推奨。
 
+このフォルダの**中に** `venv\`（約 2GB）と `models\`（2.9GB）が作られ、文字起こし結果も
+`transcripts\` に溜まっていく。最終的に 5GB 前後になるので、Downloads や一時フォルダ
+ではなく、置きっぱなしにできる場所に展開すること。
+（GitHub から ZIP で落とした場合は `WhisperTranscribe-main\` という名前で展開される）
+
 ### 3. `セットアップ.cmd` をダブルクリック
 
 専用の Python 環境を作り、必要なライブラリを入れる。数分かかる。
